@@ -1,25 +1,25 @@
-import { Sandbox } from '@e2b/code-interpreter';
+import { Sandbox } from "@e2b/code-interpreter";
 import {
   createAgent,
   createNetwork,
   createState,
   createTool,
   type Message,
-  gemini,
+  openai,
   type Tool,
-} from '@inngest/agent-kit';
-import { z } from 'zod';
+} from "@inngest/agent-kit";
+import { z } from "zod";
 
-import prisma from '@/lib/prisma';
-import { FRAGMENT_TITLE_PROMPT, PROMPT, RESPONSE_PROMPT } from '@/prompt';
-import { FileCollection } from '@/types';
-import { inngest } from './client';
+import prisma from "@/lib/prisma";
+import { FRAGMENT_TITLE_PROMPT, PROMPT, RESPONSE_PROMPT } from "@/prompt";
+import { FileCollection } from "@/types";
+import { inngest } from "./client";
 import {
   getSandbox,
   lastAssistantTextMessageContent,
   parseAgentOutput,
-} from './utils';
-import { SANDBOX_TIMEOUT_IN_MS } from '@/constants';
+} from "./utils";
+import { SANDBOX_TIMEOUT_IN_MS } from "@/constants";
 
 interface AgentState {
   summary: string;
@@ -27,17 +27,17 @@ interface AgentState {
 }
 
 export const codeAgentFunction = inngest.createFunction(
-  { id: 'code-agent' },
-  { event: 'code-agent/run' },
+  { id: "code-agent" },
+  { event: "code-agent/run" },
   async ({ event, step }) => {
-    const sandboxId = await step.run('get-sandbox-id', async () => {
-      const sandbox = await Sandbox.create('vibe-nextjs-bek-2');
+    const sandboxId = await step.run("get-sandbox-id", async () => {
+      const sandbox = await Sandbox.create("vibe-nextjs-bek-2");
       await sandbox.setTimeout(SANDBOX_TIMEOUT_IN_MS);
       return sandbox.sandboxId;
     });
 
     const previousMessages = await step.run(
-      'get-previous-messages',
+      "get-previous-messages",
       async () => {
         const formattedMessages: Message[] = [];
 
@@ -46,15 +46,15 @@ export const codeAgentFunction = inngest.createFunction(
             projectId: event.data.projectId,
           },
           orderBy: {
-            createdAt: 'desc',
+            createdAt: "desc",
           },
           take: 5,
         });
 
         for (const message of messages) {
           formattedMessages.push({
-            type: 'text',
-            role: message.role === 'ASSISTANT' ? 'assistant' : 'user',
+            type: "text",
+            role: message.role === "ASSISTANT" ? "assistant" : "user",
             content: message.content,
           });
         }
@@ -65,7 +65,7 @@ export const codeAgentFunction = inngest.createFunction(
 
     const state = createState<AgentState>(
       {
-        summary: '',
+        summary: "",
         files: {},
       },
       {
@@ -75,27 +75,27 @@ export const codeAgentFunction = inngest.createFunction(
 
     // Create a new agent with a system prompt (you can add optional tools, too)
     const codeAgent = createAgent<AgentState>({
-      name: 'code-agent',
-      description: 'An expert coding agent',
+      name: "code-agent",
+      description: "An expert coding agent",
       system: PROMPT,
-      model: gemini({
-        model: 'gemini-2.0-flash',
-        defaultParameters: {
-          generationConfig: { temperature: 0.1 },
-        },
+      model: openai({
+        model: "llama-3.3-70b-versatile",
+        apiKey: process.env.GROQ_API_KEY,
+        baseUrl: "https://api.groq.com/openai/v1",
+        defaultParameters: { temperature: 0.1 },
       }),
       tools: [
         createTool({
-          name: 'terminal',
-          description: 'Use the terminal to run commands',
+          name: "terminal",
+          description: "Use the terminal to run commands",
           parameters: z.object({
             command: z.string(),
           }),
           handler: async ({ command }, { step }) => {
-            return await step?.run('terminal', async () => {
+            return await step?.run("terminal", async () => {
               const buffers = {
-                stdout: '',
-                stderr: '',
+                stdout: "",
+                stderr: "",
               };
 
               try {
@@ -120,8 +120,8 @@ export const codeAgentFunction = inngest.createFunction(
           },
         }),
         createTool({
-          name: 'createOrUpdateFiles',
-          description: 'Create or update files in the sandbox',
+          name: "createOrUpdateFiles",
+          description: "Create or update files in the sandbox",
           parameters: z.object({
             files: z.array(
               z.object({
@@ -135,7 +135,7 @@ export const codeAgentFunction = inngest.createFunction(
             { step, network }: Tool.Options<AgentState>,
           ) => {
             const newFiles = await step?.run(
-              'createOrUpdateFiles',
+              "createOrUpdateFiles",
               async () => {
                 try {
                   const updatedFiles = network.state.data.files || {};
@@ -148,24 +148,24 @@ export const codeAgentFunction = inngest.createFunction(
 
                   return updatedFiles;
                 } catch (error) {
-                  return 'Error: ' + error;
+                  return "Error: " + error;
                 }
               },
             );
 
-            if (typeof newFiles === 'object') {
+            if (typeof newFiles === "object") {
               network.state.data.files = newFiles;
             }
           },
         }),
         createTool({
-          name: 'readFiles',
-          description: 'Read files from the sandbox',
+          name: "readFiles",
+          description: "Read files from the sandbox",
           parameters: z.object({
             files: z.array(z.string()),
           }),
           handler: async ({ files }, { step }) => {
-            return await step?.run('readFiles', async () => {
+            return await step?.run("readFiles", async () => {
               try {
                 const sandbox = await getSandbox(sandboxId);
                 const contents = [];
@@ -177,7 +177,7 @@ export const codeAgentFunction = inngest.createFunction(
 
                 return JSON.stringify(contents);
               } catch (error) {
-                return 'Error: ' + error;
+                return "Error: " + error;
               }
             });
           },
@@ -189,7 +189,7 @@ export const codeAgentFunction = inngest.createFunction(
             lastAssistantTextMessageContent(result);
 
           if (lastAssistantTextMessageText && network) {
-            if (lastAssistantTextMessageText.includes('<task_summary>')) {
+            if (lastAssistantTextMessageText.includes("<task_summary>")) {
               network.state.data.summary = lastAssistantTextMessageText;
             }
           }
@@ -200,7 +200,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     const network = createNetwork<AgentState>({
-      name: 'coding-agent-network',
+      name: "coding-agent-network",
       agents: [codeAgent],
       maxIter: 15,
       defaultState: state,
@@ -218,26 +218,26 @@ export const codeAgentFunction = inngest.createFunction(
     const result = await network.run(event.data.value, { state });
 
     const fragmentTitleGenerator = createAgent({
-      name: 'fragment-title-generator',
-      description: 'A fragment title generator',
+      name: "fragment-title-generator",
+      description: "A fragment title generator",
       system: FRAGMENT_TITLE_PROMPT,
-      model: gemini({
-        model: 'gemini-2.0-flash',
-        defaultParameters: {
-          generationConfig: { temperature: 0.1 },
-        },
+      model: openai({
+        model: "llama-3.3-70b-versatile",
+        apiKey: process.env.GROQ_API_KEY,
+        baseUrl: "https://api.groq.com/openai/v1",
+        defaultParameters: { temperature: 0.1 },
       }),
     });
 
     const responseGenerator = createAgent({
-      name: 'response-generator',
-      description: 'A response generator',
+      name: "response-generator",
+      description: "A response generator",
       system: RESPONSE_PROMPT,
-      model: gemini({
-        model: 'gemini-2.0-flash',
-        defaultParameters: {
-          generationConfig: { temperature: 0.1 },
-        },
+      model: openai({
+        model: "llama-3.3-70b-versatile",
+        apiKey: process.env.GROQ_API_KEY,
+        baseUrl: "https://api.groq.com/openai/v1",
+        defaultParameters: { temperature: 0.1 },
       }),
     });
 
@@ -253,20 +253,20 @@ export const codeAgentFunction = inngest.createFunction(
       !result.state.data.summary ||
       Object.keys(result.state.data.files || {}).length === 0;
 
-    const sandboxUrl = await step.run('get-sandbox-url', async () => {
+    const sandboxUrl = await step.run("get-sandbox-url", async () => {
       const sandbox = await getSandbox(sandboxId);
       const host = sandbox.getHost(3000);
       return `https://${host}`;
     });
 
-    await step.run('save-result', async () => {
+    await step.run("save-result", async () => {
       if (isError) {
         return await prisma.message.create({
           data: {
             projectId: event.data.projectId,
-            content: 'Something went wrong. Please try again.',
-            role: 'ASSISTANT',
-            type: 'ERROR',
+            content: "Something went wrong. Please try again.",
+            role: "ASSISTANT",
+            type: "ERROR",
           },
         });
       }
@@ -275,8 +275,8 @@ export const codeAgentFunction = inngest.createFunction(
         data: {
           projectId: event.data.projectId,
           content: parseAgentOutput(responseOutput),
-          role: 'ASSISTANT',
-          type: 'RESULT',
+          role: "ASSISTANT",
+          type: "RESULT",
           fragment: {
             create: {
               sandboxUrl,
@@ -290,7 +290,7 @@ export const codeAgentFunction = inngest.createFunction(
 
     return {
       url: sandboxUrl,
-      title: 'Fragment',
+      title: "Fragment",
       files: result.state.data.files,
       summary: result.state.data.summary,
     };
