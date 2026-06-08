@@ -1,4 +1,4 @@
-import { type SDKMessage } from "@anthropic-ai/claude-code";
+import { type SDKMessage } from "@/lib/sdk-types";
 import { useState, useEffect } from "react";
 
 interface MessageDisplayProps {
@@ -24,7 +24,7 @@ export default function MessageDisplay({ messages }: MessageDisplayProps) {
       })
       .filter(Boolean);
     
-    setGeneratedPages([...new Set(pages)]);
+    setGeneratedPages(Array.from(new Set(pages.filter(Boolean) as string[])));
   }, [messages]);
   
   if (messages.length === 0) return null;

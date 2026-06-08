@@ -3,3 +3,6 @@ node_modules/
 .env.local
 dist/
 *.log
+lovable-ui/.next/
+lovable-ui/out/
+.vercel

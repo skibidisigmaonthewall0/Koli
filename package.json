@@ -11,6 +11,7 @@
   "description": "",
   "dependencies": {
     "@anthropic-ai/claude-code": "^1.0.39",
+    "@musistudio/claude-code-router": "^2.0.0",
     "@types/node": "^24.0.10",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"

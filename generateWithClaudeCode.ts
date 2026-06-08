@@ -1,4 +1,5 @@
 import { query, type SDKMessage } from "@anthropic-ai/claude-code";
+import { withGroqRouter } from "./groq-router";
 
 interface CodeGenerationResult {
   success: boolean;
@@ -11,6 +12,7 @@ export async function generateCodeWithClaude(prompt: string): Promise<CodeGenera
     const messages: SDKMessage[] = [];
     const abortController = new AbortController();
     
+    await withGroqRouter(async () => {
     // Execute the query and collect all messages
     for await (const message of query({
       prompt: prompt,
@@ -37,6 +39,7 @@ export async function generateCodeWithClaude(prompt: string): Promise<CodeGenera
       // Log each message for debugging
       console.log(`[${message.type}]`, message);
     }
+    });
     
     return {
       success: true,
