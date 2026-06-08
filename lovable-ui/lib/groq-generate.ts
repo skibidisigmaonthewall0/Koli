@@ -17,18 +17,70 @@ function stripCodeFences(text: string): string {
   return text.trim();
 }
 
+const ALLOWED_IMPORT_SOURCES = new Set(["react", "react-dom"]);
+
+function sanitizePageCode(code: string): string {
+  const lines = code.split("\n");
+  const cleaned: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("import ")) {
+      const match = trimmed.match(/from\s+['"]([^'"]+)['"]/);
+      const source = match?.[1];
+      if (source && ALLOWED_IMPORT_SOURCES.has(source)) {
+        cleaned.push(line);
+      }
+      continue;
+    }
+
+    if (trimmed.includes("next/head") || trimmed.includes("<Head")) {
+      continue;
+    }
+
+    cleaned.push(line);
+  }
+
+  let result = cleaned.join("\n");
+  result = result.replace(/export\s+default\s+App\b/g, "export default function Page");
+  result = result.replace(/function\s+App\s*\(/g, "function Page(");
+  result = result.replace(/const\s+App\s*=/g, "const Page =");
+
+  return result.trim();
+}
+
 function ensureUseClient(code: string): string {
-  if (code.includes('"use client"') || code.includes("'use client'")) {
+  const withoutDirective = code
+    .replace(/^["']use client["'];\s*/m, "")
+    .trim();
+
+  const needsClient =
+    withoutDirective.includes("useState") ||
+    withoutDirective.includes("useEffect") ||
+    withoutDirective.includes("onClick") ||
+    withoutDirective.includes("onChange");
+
+  if (needsClient) {
+    return `"use client";\n\n${withoutDirective}`;
+  }
+  return withoutDirective;
+}
+
+function ensureDefaultExport(code: string): string {
+  if (/export\s+default\s+function\s+Page/.test(code)) {
     return code;
   }
-  if (
-    code.includes("useState") ||
-    code.includes("useEffect") ||
-    code.includes("onClick")
-  ) {
-    return `"use client";\n\n${code}`;
+  if (/export\s+default/.test(code)) {
+    return code;
   }
-  return code;
+  return `${code}\n\nexport default function Page() {
+  return (
+    <main className="min-h-screen p-8">
+      <h1 className="text-2xl font-bold text-white">Generated App</h1>
+    </main>
+  );
+}\n`;
 }
 
 async function callGroq(
@@ -96,19 +148,26 @@ export async function generateFilesWithGroq(
 ): Promise<GeneratedFile[]> {
   onLog?.(`Calling Groq (${getGroqModel()}) for page code only...`);
 
-  const system =
-    "You write React/Next.js page components. Return ONLY the TypeScript/TSX code for app/page.tsx. No markdown fences. No explanation. Use Tailwind CSS classes. Add 'use client' if the page needs interactivity.";
+  const system = `You write a single Next.js 14 app/page.tsx file.
 
-  const user = `Build this as a single Next.js page component:\n${prompt}`;
+STRICT RULES:
+- Return ONLY raw TSX code. No markdown fences. No explanation.
+- ONLY import from "react" (useState, useEffect, etc). NO other imports.
+- NEVER use: marked, axios, next/head, next/router, or any npm package.
+- Use Tailwind CSS className for all styling.
+- Use "use client" at the top if the page has buttons, games, or state.
+- Must end with: export default function Page() { ... }
+- Put all UI in one file. Use inline data/constants instead of fetching external libs.`;
+
+  const user = `Build this as one self-contained page:\n${prompt}`;
 
   const raw = await callGroq(system, user, 1500);
   onLog?.("Groq response received");
 
-  let pageCode = ensureUseClient(stripCodeFences(raw));
-
-  if (!pageCode.includes("export default")) {
-    pageCode = `${pageCode}\n\nexport default function Page() {\n  return <main className="p-8"><h1 className="text-2xl font-bold">Generated</h1></main>;\n}\n`;
-  }
+  let pageCode = stripCodeFences(raw);
+  pageCode = sanitizePageCode(pageCode);
+  pageCode = ensureUseClient(pageCode);
+  pageCode = ensureDefaultExport(pageCode);
 
   const files = getNextJsScaffold();
   files.push({ path: "app/page.tsx", content: pageCode });
