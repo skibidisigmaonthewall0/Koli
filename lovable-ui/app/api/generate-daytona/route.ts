@@ -49,24 +49,6 @@ function createLogHandler(
       return;
     }
 
-    if (line.includes("__FILES__")) {
-      const jsonStart = line.indexOf("__FILES__") + "__FILES__".length;
-      try {
-        const payload = JSON.parse(line.substring(jsonStart).trim());
-        await writer.write(
-          encoder.encode(
-            `data: ${JSON.stringify({
-              type: "files",
-              files: payload.files,
-            })}\n\n`
-          )
-        );
-      } catch {
-        // Ignore parse errors
-      }
-      return;
-    }
-
     if (line.includes("__TOOL_USE__")) {
       const jsonStart =
         line.indexOf("__TOOL_USE__") + "__TOOL_USE__".length;
@@ -140,6 +122,18 @@ export async function POST(req: NextRequest) {
     const stream = new TransformStream();
     const writer = stream.writable.getWriter();
 
+    const sendHeartbeat = setInterval(async () => {
+      try {
+        await writer.write(
+          encoder.encode(
+            `data: ${JSON.stringify({ type: "heartbeat" })}\n\n`
+          )
+        );
+      } catch {
+        clearInterval(sendHeartbeat);
+      }
+    }, 10000);
+
     (async () => {
       try {
         const onLog = createLogHandler(writer, encoder);
@@ -154,6 +148,16 @@ export async function POST(req: NextRequest) {
           : await generateWebsiteInDaytona({
               prompt,
               onLog,
+              onSandboxReady: async (id) => {
+                await writer.write(
+                  encoder.encode(
+                    `data: ${JSON.stringify({
+                      type: "sandbox_ready",
+                      sandboxId: id,
+                    })}\n\n`
+                  )
+                );
+              },
             });
 
         await writer.write(
@@ -162,10 +166,7 @@ export async function POST(req: NextRequest) {
               type: "complete",
               sandboxId: result.sandboxId,
               previewUrl: result.previewUrl,
-              files: result.files?.map((f) => ({
-                path: f.path,
-                content: f.content,
-              })),
+              files: result.files,
             })}\n\n`
           )
         );
@@ -180,6 +181,7 @@ export async function POST(req: NextRequest) {
         );
         await writer.write(encoder.encode("data: [DONE]\n\n"));
       } finally {
+        clearInterval(sendHeartbeat);
         await writer.close();
       }
     })();

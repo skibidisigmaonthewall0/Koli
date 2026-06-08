@@ -1,16 +1,23 @@
-import { Daytona } from "@daytonaio/sdk";
 import {
   generateFilesWithGroq,
   generateFollowUpFiles,
   type GeneratedFile,
 } from "./groq-generate";
+import { getNextJsScaffold } from "./nextjs-scaffold";
+import {
+  findSandbox,
+  getDaytona,
+  getIframePreviewUrl,
+  getSandboxRootDir,
+  type DaytonaSandbox,
+} from "./daytona-sandbox";
 
 export interface DaytonaGenerateResult {
   success: boolean;
   sandboxId: string;
   projectDir: string;
   previewUrl: string;
-  files?: GeneratedFile[];
+  files: GeneratedFile[];
 }
 
 export interface DaytonaGenerateOptions {
@@ -19,6 +26,7 @@ export interface DaytonaGenerateOptions {
   followUp?: string;
   originalPrompt?: string;
   onLog?: (line: string) => void;
+  onSandboxReady?: (sandboxId: string) => void;
 }
 
 const PROJECT_DIR = "website-project";
@@ -32,84 +40,31 @@ function createLogger(onLog?: (line: string) => void) {
   };
 }
 
-export async function generateWebsiteInDaytona({
-  sandboxId: sandboxIdArg,
-  prompt,
-  onLog,
-}: DaytonaGenerateOptions): Promise<DaytonaGenerateResult> {
-  const log = createLogger(onLog);
-
-  log("🚀 Starting website generation...\n");
-
-  if (!process.env.DAYTONA_API_KEY || !process.env.GROQ_API_KEY) {
-    throw new Error("DAYTONA_API_KEY and GROQ_API_KEY must be set");
-  }
-
-  const daytona = new Daytona({
-    apiKey: process.env.DAYTONA_API_KEY,
-  });
-
-  let sandbox: Awaited<ReturnType<Daytona["create"]>> | undefined;
-  let sandboxId = sandboxIdArg;
-
-  try {
-    if (sandboxId) {
-      log(`1. Using existing sandbox: ${sandboxId}`);
-      const sandboxes = await daytona.list();
-      sandbox = sandboxes.find((s: { id: string }) => s.id === sandboxId);
-      if (!sandbox) {
-        throw new Error(`Sandbox ${sandboxId} not found`);
-      }
-      log(`✓ Connected to sandbox: ${sandbox.id}`);
-    } else {
-      log("1. Creating Daytona sandbox...");
-      sandbox = await daytona.create({
-        public: true,
-        image: "node:20",
-      });
-      sandboxId = sandbox.id;
-      log(`✓ Sandbox created: ${sandboxId}`);
+async function waitForDevServer(
+  sandbox: DaytonaSandbox,
+  rootDir: string,
+  log: (message: string) => void
+) {
+  log("Waiting for dev server...");
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const check = await sandbox.process.executeCommand(
+      `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000 || echo fail`,
+      rootDir,
+      undefined,
+      15000
+    );
+    const status = check.result?.trim();
+    if (status === "200" || status === "304") {
+      log("✓ Dev server is ready");
+      return;
     }
-
-    const rootDir = await sandbox.getUserRootDir();
-
-    log("\n2. Setting up project directory...");
-    await sandbox.fs.createFolder(PROJECT_DIR, "755");
-    log(`✓ Project directory ready`);
-
-    log("\n3. Generating code with Groq (on server)...");
-    log(`Prompt: "${prompt}"`);
-
-    const files = await generateFilesWithGroq(prompt, log);
-
-    await uploadFiles(sandbox, files, log);
-    emitFilesEvent(files, log);
-    await installAndStartServer(sandbox, rootDir, log, { fresh: true });
-
-    log("\n7. Getting preview URL...");
-    const preview = await sandbox.getPreviewLink(3000);
-
-    log("\n✨ SUCCESS!");
-    log(`Sandbox ID: ${sandboxId}`);
-    log(`Preview URL: ${preview.url}`);
-
-    return {
-      success: true,
-      sandboxId: sandboxId!,
-      projectDir: `${rootDir}/${PROJECT_DIR}`,
-      previewUrl: preview.url,
-      files,
-    };
-  } catch (error) {
-    if (sandbox && sandboxId) {
-      log(`\nSandbox ID: ${sandboxId}`);
-    }
-    throw error;
+    await new Promise((resolve) => setTimeout(resolve, 3000));
   }
+  log("⚠️ Dev server may still be starting...");
 }
 
 async function uploadFiles(
-  sandbox: { fs: { uploadFiles: (files: { source: Buffer; destination: string }[], timeout?: number) => Promise<void> } },
+  sandbox: DaytonaSandbox,
   files: GeneratedFile[],
   log: (message: string) => void
 ) {
@@ -135,7 +90,7 @@ async function uploadFiles(
 }
 
 async function installAndStartServer(
-  sandbox: { process: { executeCommand: (cmd: string, cwd?: string, env?: Record<string, string>, timeout?: number) => Promise<{ exitCode?: number; result?: string }> } },
+  sandbox: DaytonaSandbox,
   rootDir: string,
   log: (message: string) => void,
   options: { fresh: boolean }
@@ -167,8 +122,96 @@ async function installAndStartServer(
     { PORT: "3000" }
   );
 
-  log("Waiting for server...");
-  await new Promise((resolve) => setTimeout(resolve, options.fresh ? 12000 : 8000));
+  await waitForDevServer(sandbox, rootDir, log);
+}
+
+export async function generateWebsiteInDaytona({
+  sandboxId: sandboxIdArg,
+  prompt,
+  onLog,
+  onSandboxReady,
+}: DaytonaGenerateOptions): Promise<DaytonaGenerateResult> {
+  const log = createLogger(onLog);
+
+  log("🚀 Starting website generation...\n");
+
+  if (!process.env.DAYTONA_API_KEY || !process.env.GROQ_API_KEY) {
+    throw new Error("DAYTONA_API_KEY and GROQ_API_KEY must be set");
+  }
+
+  const daytona = getDaytona();
+  let sandbox: DaytonaSandbox | undefined;
+  let sandboxId = sandboxIdArg;
+
+  try {
+    if (sandboxId) {
+      log(`1. Using existing sandbox: ${sandboxId}`);
+      sandbox = await findSandbox(sandboxId);
+      log(`✓ Connected to sandbox: ${sandbox.id}`);
+    } else {
+      log("1. Creating Daytona sandbox...");
+      sandbox = await daytona.create(
+        { image: "node:20", public: true },
+        { timeout: 120 }
+      );
+      sandboxId = sandbox.id;
+      log(`✓ Sandbox created: ${sandboxId}`);
+      onSandboxReady?.(sandboxId);
+    }
+
+    const rootDir = await getSandboxRootDir(sandbox);
+
+    log("\n2. Setting up project + generating code in parallel...");
+    await sandbox.fs.createFolder(PROJECT_DIR, "755");
+
+    const scaffold = getNextJsScaffold();
+    const npmPromise = (async () => {
+      await uploadFiles(sandbox!, scaffold, log);
+      log("\n3. Installing scaffold dependencies (while AI writes code)...");
+      const npmInstall = await sandbox!.process.executeCommand(
+        `cd ${PROJECT_DIR} && npm install`,
+        rootDir,
+        undefined,
+        300000
+      );
+      if (npmInstall.exitCode !== 0) {
+        throw new Error(`npm install failed: ${npmInstall.result || "unknown error"}`);
+      }
+      log("✓ Scaffold dependencies installed");
+    })();
+
+    log(`\nGenerating code for: "${prompt}"`);
+    const aiFilesPromise = generateFilesWithGroq(prompt, log);
+
+    const [, aiFiles] = await Promise.all([npmPromise, aiFilesPromise]);
+    const aiOnly = aiFiles.filter(
+      (f) => f.path === "components/AppContent.tsx" || f.path === "app/page.tsx"
+    );
+    const allFiles = [...scaffold, ...aiOnly];
+
+    await uploadFiles(sandbox, aiOnly, log);
+    await installAndStartServer(sandbox, rootDir, log, { fresh: false });
+
+    log("\n7. Getting preview URL...");
+    const previewUrl = await getIframePreviewUrl(sandbox, 3000);
+
+    log("\n✨ SUCCESS!");
+    log(`Sandbox ID: ${sandboxId}`);
+    log(`Preview URL: ${previewUrl}`);
+
+    return {
+      success: true,
+      sandboxId: sandboxId!,
+      projectDir: `${rootDir}/${PROJECT_DIR}`,
+      previewUrl,
+      files: allFiles,
+    };
+  } catch (error) {
+    if (sandbox && sandboxId) {
+      log(`\nSandbox ID: ${sandboxId}`);
+    }
+    throw error;
+  }
 }
 
 export async function iterateWebsiteInDaytona({
@@ -190,16 +233,9 @@ export async function iterateWebsiteInDaytona({
     throw new Error("DAYTONA_API_KEY and GROQ_API_KEY must be set");
   }
 
-  const daytona = new Daytona({ apiKey: process.env.DAYTONA_API_KEY });
-  const sandboxes = await daytona.list();
-  const sandbox = sandboxes.find((s: { id: string }) => s.id === sandboxId);
-
-  if (!sandbox) {
-    throw new Error(`Sandbox ${sandboxId} not found`);
-  }
-
+  const sandbox = await findSandbox(sandboxId);
   log(`✓ Connected to sandbox: ${sandboxId}`);
-  const rootDir = await sandbox.getUserRootDir();
+  const rootDir = await getSandboxRootDir(sandbox);
 
   log("\n2. Reading current code from sandbox...");
   const existingComponent = (
@@ -223,28 +259,23 @@ export async function iterateWebsiteInDaytona({
   );
 
   await uploadFiles(sandbox, files, log);
-  emitFilesEvent(files, log);
   await installAndStartServer(sandbox, rootDir, log, { fresh: false });
 
   log("\n4. Getting preview URL...");
-  const preview = await sandbox.getPreviewLink(3000);
+  const previewUrl = await getIframePreviewUrl(sandbox, 3000);
 
   log("\n✨ Follow-up applied!");
-  log(`Preview URL: ${preview.url}`);
+  log(`Preview URL: ${previewUrl}`);
+
+  const scaffold = getNextJsScaffold();
 
   return {
     success: true,
     sandboxId,
     projectDir: `${rootDir}/${PROJECT_DIR}`,
-    previewUrl: preview.url,
-    files,
+    previewUrl,
+    files: [...scaffold, ...files],
   };
 }
 
-function emitFilesEvent(files: GeneratedFile[], log: (message: string) => void) {
-  log(
-    `__FILES__ ${JSON.stringify({
-      files: files.map((f) => ({ path: f.path, content: f.content })),
-    })}`
-  );
-}
+export { deleteSandbox, keepSandboxAlive } from "./daytona-sandbox";

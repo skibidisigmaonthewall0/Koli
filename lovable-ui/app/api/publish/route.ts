@@ -1,5 +1,4 @@
 import { NextRequest } from "next/server";
-import { publishSite } from "@/lib/publish";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -16,13 +15,16 @@ export async function POST(req: NextRequest) {
     }
 
     if (!process.env.DAYTONA_API_KEY) {
-      return Response.json({ error: "DAYTONA_API_KEY not set" }, { status: 500 });
+      return Response.json({ error: "DAYTONA_API_KEY is not set" }, { status: 500 });
     }
 
-    const result = await publishSite(sandboxId, projectName);
+    const { publishSiteFromSandbox } = await import("@/lib/publish-site");
+    const result = await publishSiteFromSandbox(sandboxId, projectName);
+
     return Response.json(result);
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Publish failed";
+    const message =
+      error instanceof Error ? error.message : "Publish failed";
     return Response.json({ error: message }, { status: 500 });
   }
 }
