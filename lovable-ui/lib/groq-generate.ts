@@ -1,3 +1,5 @@
+import { getNextJsScaffold } from "./nextjs-scaffold";
+
 export interface GeneratedFile {
   path: string;
   content: string;
@@ -7,31 +9,41 @@ function getGroqModel(): string {
   return process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 }
 
-const SYSTEM_PROMPT = `You are an expert web developer. Return ONLY valid JSON with this exact shape:
-{"files":[{"path":"package.json","content":"..."},{"path":"app/page.tsx","content":"..."}]}
+function stripCodeFences(text: string): string {
+  const fenced = text.match(/```(?:tsx|typescript|jsx|javascript)?\s*([\s\S]*?)```/);
+  if (fenced) {
+    return fenced[1].trim();
+  }
+  return text.trim();
+}
 
-Rules:
-- Create a complete Next.js 14 app (app router) with TypeScript and Tailwind CSS.
-- Always include: package.json, next.config.mjs, tsconfig.json, postcss.config.mjs, tailwind.config.ts, app/layout.tsx, app/page.tsx, app/globals.css.
-- package.json must have scripts dev/build/start and dependencies next, react, react-dom, typescript, tailwindcss, postcss, autoprefixer, @types/react, @types/node.
-- For games or interactive UIs, use a client component in app/page.tsx with "use client".
-- Match the user request closely. Keep files minimal but working.
-- Escape newlines properly inside JSON strings. No markdown fences.`;
+function ensureUseClient(code: string): string {
+  if (code.includes('"use client"') || code.includes("'use client'")) {
+    return code;
+  }
+  if (
+    code.includes("useState") ||
+    code.includes("useEffect") ||
+    code.includes("onClick")
+  ) {
+    return `"use client";\n\n${code}`;
+  }
+  return code;
+}
 
-export async function generateFilesWithGroq(
-  prompt: string,
-  onLog?: (message: string) => void
-): Promise<GeneratedFile[]> {
+async function callGroq(
+  system: string,
+  user: string,
+  maxTokens: number
+): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
     throw new Error("GROQ_API_KEY is not set");
   }
 
   const model = getGroqModel();
-  onLog?.(`Calling Groq API (${model})...`);
-
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 120000);
+  const timeout = setTimeout(() => controller.abort(), 90000);
 
   try {
     const response = await fetch(
@@ -45,12 +57,11 @@ export async function generateFilesWithGroq(
         body: JSON.stringify({
           model,
           messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: prompt },
+            { role: "system", content: system },
+            { role: "user", content: user },
           ],
-          max_tokens: 8000,
-          temperature: 0.3,
-          response_format: { type: "json_object" },
+          max_tokens: maxTokens,
+          temperature: 0.4,
         }),
         signal: controller.signal,
       }
@@ -58,7 +69,7 @@ export async function generateFilesWithGroq(
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Groq API error ${response.status}: ${errorText}`);
+      throw new Error(`Groq API ${response.status}: ${errorText}`);
     }
 
     const data = await response.json();
@@ -68,21 +79,40 @@ export async function generateFilesWithGroq(
       throw new Error("Groq returned an empty response");
     }
 
-    onLog?.("Groq response received, parsing files...");
-
-    const parsed = JSON.parse(content) as { files?: GeneratedFile[] };
-    if (!parsed.files?.length) {
-      throw new Error("Groq response did not include any files");
-    }
-
-    onLog?.(`Got ${parsed.files.length} files from Groq`);
-    return parsed.files;
+    return content;
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("Groq API timed out after 120 seconds");
+      throw new Error("Groq API timed out");
     }
     throw error;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export async function generateFilesWithGroq(
+  prompt: string,
+  onLog?: (message: string) => void
+): Promise<GeneratedFile[]> {
+  onLog?.(`Calling Groq (${getGroqModel()}) for page code only...`);
+
+  const system =
+    "You write React/Next.js page components. Return ONLY the TypeScript/TSX code for app/page.tsx. No markdown fences. No explanation. Use Tailwind CSS classes. Add 'use client' if the page needs interactivity.";
+
+  const user = `Build this as a single Next.js page component:\n${prompt}`;
+
+  const raw = await callGroq(system, user, 1500);
+  onLog?.("Groq response received");
+
+  let pageCode = ensureUseClient(stripCodeFences(raw));
+
+  if (!pageCode.includes("export default")) {
+    pageCode = `${pageCode}\n\nexport default function Page() {\n  return <main className="p-8"><h1 className="text-2xl font-bold">Generated</h1></main>;\n}\n`;
+  }
+
+  const files = getNextJsScaffold();
+  files.push({ path: "app/page.tsx", content: pageCode });
+
+  onLog?.(`Ready: ${files.length} files (1 from Groq, rest from template)`);
+  return files;
 }
