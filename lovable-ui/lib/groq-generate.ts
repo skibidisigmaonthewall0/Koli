@@ -5,8 +5,16 @@ export interface GeneratedFile {
   content: string;
 }
 
+const COMPONENT_PATH = "components/AppContent.tsx";
+
 function getGroqModel(): string {
   return process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+}
+
+function emitAssistantMessage(onLog: ((message: string) => void) | undefined, content: string) {
+  onLog?.(
+    `__CLAUDE_MESSAGE__ ${JSON.stringify({ type: "assistant", content })}`
+  );
 }
 
 function stripCodeFences(text: string): string {
@@ -17,19 +25,25 @@ function stripCodeFences(text: string): string {
   return text.trim();
 }
 
-const ALLOWED_IMPORT_SOURCES = new Set(["react", "react-dom"]);
+function sanitizeCode(
+  code: string,
+  options: { extraImports?: string[]; defaultExportName?: string }
+): string {
+  const allowed = new Set([
+    "react",
+    "react-dom",
+    ...(options.extraImports || []),
+  ]);
 
-function sanitizePageCode(code: string): string {
-  const lines = code.split("\n");
   const cleaned: string[] = [];
 
-  for (const line of lines) {
+  for (const line of code.split("\n")) {
     const trimmed = line.trim();
 
     if (trimmed.startsWith("import ")) {
       const match = trimmed.match(/from\s+['"]([^'"]+)['"]/);
       const source = match?.[1];
-      if (source && ALLOWED_IMPORT_SOURCES.has(source)) {
+      if (source && allowed.has(source)) {
         cleaned.push(line);
       }
       continue;
@@ -42,24 +56,31 @@ function sanitizePageCode(code: string): string {
     cleaned.push(line);
   }
 
-  let result = cleaned.join("\n");
-  result = result.replace(/export\s+default\s+App\b/g, "export default function Page");
-  result = result.replace(/function\s+App\s*\(/g, "function Page(");
-  result = result.replace(/const\s+App\s*=/g, "const Page =");
+  let result = cleaned.join("\n").trim();
+  const exportName = options.defaultExportName || "Page";
 
-  return result.trim();
+  if (exportName === "AppContent") {
+    result = result.replace(/export\s+default\s+function\s+\w+/g, "export default function AppContent");
+    if (!/export\s+default\s+function\s+AppContent/.test(result)) {
+      result = result.replace(/export\s+default\s+\w+/g, "export default function AppContent");
+    }
+  } else {
+    result = result.replace(/export\s+default\s+App\b/g, `export default function ${exportName}`);
+    result = result.replace(/function\s+App\s*\(/g, `function ${exportName}(`);
+  }
+
+  return result;
 }
 
 function ensureUseClient(code: string): string {
-  const withoutDirective = code
-    .replace(/^["']use client["'];\s*/m, "")
-    .trim();
+  const withoutDirective = code.replace(/^["']use client["'];\s*/m, "").trim();
 
   const needsClient =
     withoutDirective.includes("useState") ||
     withoutDirective.includes("useEffect") ||
     withoutDirective.includes("onClick") ||
-    withoutDirective.includes("onChange");
+    withoutDirective.includes("onChange") ||
+    withoutDirective.includes("onSubmit");
 
   if (needsClient) {
     return `"use client";\n\n${withoutDirective}`;
@@ -67,20 +88,14 @@ function ensureUseClient(code: string): string {
   return withoutDirective;
 }
 
-function ensureDefaultExport(code: string): string {
-  if (/export\s+default\s+function\s+Page/.test(code)) {
+function ensureDefaultExport(code: string, name: string, fallback: string): string {
+  if (new RegExp(`export\\s+default\\s+function\\s+${name}`).test(code)) {
     return code;
   }
   if (/export\s+default/.test(code)) {
     return code;
   }
-  return `${code}\n\nexport default function Page() {
-  return (
-    <main className="min-h-screen p-8">
-      <h1 className="text-2xl font-bold text-white">Generated App</h1>
-    </main>
-  );
-}\n`;
+  return `${code}\n\n${fallback}`;
 }
 
 async function callGroq(
@@ -113,7 +128,7 @@ async function callGroq(
             { role: "user", content: user },
           ],
           max_tokens: maxTokens,
-          temperature: 0.4,
+          temperature: 0.35,
         }),
         signal: controller.signal,
       }
@@ -142,36 +157,136 @@ async function callGroq(
   }
 }
 
+async function createPlan(
+  prompt: string,
+  onLog?: (message: string) => void
+): Promise<string> {
+  onLog?.("🧠 Thinking about your request...");
+  emitAssistantMessage(onLog, "Let me plan this before writing any code...");
+
+  const plan = await callGroq(
+    `You are a senior frontend engineer. Plan a Next.js app BEFORE coding.
+
+Output a clear plan with these sections:
+## Goal
+## Features (bullets)
+## Layout (header, main, sections)
+## Component: AppContent (what it does, state, interactions)
+## Page shell (what app/page.tsx wraps)
+## Polish (colors, responsive, UX details)
+
+Rules: NO code. Be specific and practical. Under 350 words.`,
+    `User request: ${prompt}`,
+    900
+  );
+
+  emitAssistantMessage(onLog, `**Plan**\n\n${plan.trim()}`);
+  onLog?.("✓ Plan ready — starting implementation");
+  return plan.trim();
+}
+
+async function generateComponent(
+  prompt: string,
+  plan: string,
+  onLog?: (message: string) => void
+): Promise<string> {
+  onLog?.("✏️ Writing main component (components/AppContent.tsx)...");
+
+  const raw = await callGroq(
+    `Write components/AppContent.tsx for Next.js 14.
+
+STRICT RULES:
+- Return ONLY raw TSX. No markdown. No explanation.
+- Start with "use client";
+- export default function AppContent()
+- ONLY import from "react"
+- NO npm packages (no marked, axios, next/head, etc.)
+- Tailwind className only — make it look polished (dark theme, spacing, rounded cards)
+- Implement ALL interactive logic here (games, forms, state, etc.)
+- Complete working code — no placeholders or TODOs`,
+    `User request: ${prompt}\n\nPlan to follow:\n${plan}`,
+    2200
+  );
+
+  let code = stripCodeFences(raw);
+  code = sanitizeCode(code, { defaultExportName: "AppContent" });
+  code = ensureUseClient(code);
+  code = ensureDefaultExport(
+    code,
+    "AppContent",
+    `export default function AppContent() {
+  return <div className="p-6 text-white">App content</div>;
+}`
+  );
+
+  onLog?.("✓ Main component written");
+  return code;
+}
+
+async function generatePage(
+  prompt: string,
+  plan: string,
+  onLog?: (message: string) => void
+): Promise<string> {
+  onLog?.("✏️ Writing page shell (app/page.tsx)...");
+
+  const raw = await callGroq(
+    `Write app/page.tsx for Next.js 14 app router.
+
+STRICT RULES:
+- Return ONLY raw TSX. No markdown. No explanation.
+- export default function Page()
+- MUST import AppContent from "@/components/AppContent"
+- ONLY imports allowed: "react" and "@/components/AppContent"
+- Tailwind only — full-screen dark layout, title, padding, centered content
+- Page is a shell — put minimal logic here, main UI is in AppContent`,
+    `User request: ${prompt}\n\nPlan:\n${plan}`,
+    800
+  );
+
+  let code = stripCodeFences(raw);
+  code = sanitizeCode(code, {
+    extraImports: ["@/components/AppContent"],
+    defaultExportName: "Page",
+  });
+
+  if (!code.includes("@/components/AppContent")) {
+    code = `import AppContent from "@/components/AppContent";\n\n${code}`;
+  }
+
+  code = ensureDefaultExport(
+    code,
+    "Page",
+    `export default function Page() {
+  return (
+    <main className="min-h-screen bg-gray-950 text-white">
+      <div className="mx-auto max-w-4xl px-6 py-10">
+        <h1 className="mb-8 text-3xl font-bold">Generated App</h1>
+        <AppContent />
+      </div>
+    </main>
+  );
+}`
+  );
+
+  onLog?.("✓ Page shell written");
+  return code;
+}
+
 export async function generateFilesWithGroq(
   prompt: string,
   onLog?: (message: string) => void
 ): Promise<GeneratedFile[]> {
-  onLog?.(`Calling Groq (${getGroqModel()}) for page code only...`);
+  onLog?.(`Using Groq model: ${getGroqModel()}`);
 
-  const system = `You write a single Next.js 14 app/page.tsx file.
-
-STRICT RULES:
-- Return ONLY raw TSX code. No markdown fences. No explanation.
-- ONLY import from "react" (useState, useEffect, etc). NO other imports.
-- NEVER use: marked, axios, next/head, next/router, or any npm package.
-- Use Tailwind CSS className for all styling.
-- Use "use client" at the top if the page has buttons, games, or state.
-- Must end with: export default function Page() { ... }
-- Put all UI in one file. Use inline data/constants instead of fetching external libs.`;
-
-  const user = `Build this as one self-contained page:\n${prompt}`;
-
-  const raw = await callGroq(system, user, 1500);
-  onLog?.("Groq response received");
-
-  let pageCode = stripCodeFences(raw);
-  pageCode = sanitizePageCode(pageCode);
-  pageCode = ensureUseClient(pageCode);
-  pageCode = ensureDefaultExport(pageCode);
+  const plan = await createPlan(prompt, onLog);
+  const componentCode = await generateComponent(prompt, plan, onLog);
+  const pageCode = await generatePage(prompt, plan, onLog);
 
   const files = getNextJsScaffold();
+  files.push({ path: COMPONENT_PATH, content: componentCode });
   files.push({ path: "app/page.tsx", content: pageCode });
 
-  onLog?.(`Ready: ${files.length} files (1 from Groq, rest from template)`);
+  onLog?.(`✓ Done — ${files.length} files (${files.length - getNextJsScaffold().length} written by AI)`);
   return files;
 }
