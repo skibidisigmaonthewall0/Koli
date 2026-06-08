@@ -3,6 +3,9 @@
   "functions": {
     "app/api/generate-daytona/route.ts": {
       "maxDuration": 300
+    },
+    "app/api/publish/route.ts": {
+      "maxDuration": 300
     }
   }
 }

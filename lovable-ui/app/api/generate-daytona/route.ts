@@ -25,12 +25,102 @@ export async function GET() {
   });
 }
 
+function createLogHandler(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  encoder: TextEncoder
+) {
+  return async (line: string) => {
+    if (line.includes("__CLAUDE_MESSAGE__")) {
+      const jsonStart =
+        line.indexOf("__CLAUDE_MESSAGE__") + "__CLAUDE_MESSAGE__".length;
+      try {
+        const message = JSON.parse(line.substring(jsonStart).trim());
+        await writer.write(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: "claude_message",
+              content: message.content,
+            })}\n\n`
+          )
+        );
+      } catch {
+        // Ignore parse errors
+      }
+      return;
+    }
+
+    if (line.includes("__FILES__")) {
+      const jsonStart = line.indexOf("__FILES__") + "__FILES__".length;
+      try {
+        const payload = JSON.parse(line.substring(jsonStart).trim());
+        await writer.write(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: "files",
+              files: payload.files,
+            })}\n\n`
+          )
+        );
+      } catch {
+        // Ignore parse errors
+      }
+      return;
+    }
+
+    if (line.includes("__TOOL_USE__")) {
+      const jsonStart =
+        line.indexOf("__TOOL_USE__") + "__TOOL_USE__".length;
+      try {
+        const toolUse = JSON.parse(line.substring(jsonStart).trim());
+        await writer.write(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: "tool_use",
+              name: toolUse.name,
+              input: toolUse.input,
+            })}\n\n`
+          )
+        );
+      } catch {
+        // Ignore parse errors
+      }
+      return;
+    }
+
+    if (
+      line.trim() &&
+      !line.includes("[Claude]:") &&
+      !line.includes("[Tool]:") &&
+      !line.includes("__")
+    ) {
+      await writer.write(
+        encoder.encode(
+          `data: ${JSON.stringify({
+            type: "progress",
+            message: line.trim(),
+          })}\n\n`
+        )
+      );
+    }
+  };
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { prompt } = await req.json();
+    const body = await req.json();
+    const { prompt, followUp, sandboxId, originalPrompt } = body;
 
-    if (!prompt) {
+    const isFollowUp = Boolean(followUp && sandboxId);
+
+    if (!isFollowUp && !prompt) {
       return Response.json({ error: "Prompt is required" }, { status: 400 });
+    }
+
+    if (isFollowUp && !originalPrompt) {
+      return Response.json(
+        { error: "originalPrompt is required for follow-ups" },
+        { status: 400 }
+      );
     }
 
     if (!process.env.DAYTONA_API_KEY || !process.env.GROQ_API_KEY) {
@@ -43,7 +133,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { generateWebsiteInDaytona } = await loadGenerator();
+    const { generateWebsiteInDaytona, iterateWebsiteInDaytona } =
+      await loadGenerator();
 
     const encoder = new TextEncoder();
     const stream = new TransformStream();
@@ -51,88 +142,30 @@ export async function POST(req: NextRequest) {
 
     (async () => {
       try {
-        let sandboxId = "";
-        let previewUrl = "";
+        const onLog = createLogHandler(writer, encoder);
 
-        const result = await generateWebsiteInDaytona({
-          prompt,
-          onLog: async (line) => {
-            if (line.includes("__CLAUDE_MESSAGE__")) {
-              const jsonStart =
-                line.indexOf("__CLAUDE_MESSAGE__") + "__CLAUDE_MESSAGE__".length;
-              try {
-                const message = JSON.parse(line.substring(jsonStart).trim());
-                await writer.write(
-                  encoder.encode(
-                    `data: ${JSON.stringify({
-                      type: "claude_message",
-                      content: message.content,
-                    })}\n\n`
-                  )
-                );
-              } catch {
-                // Ignore parse errors
-              }
-              return;
-            }
-
-            if (line.includes("__TOOL_USE__")) {
-              const jsonStart =
-                line.indexOf("__TOOL_USE__") + "__TOOL_USE__".length;
-              try {
-                const toolUse = JSON.parse(line.substring(jsonStart).trim());
-                await writer.write(
-                  encoder.encode(
-                    `data: ${JSON.stringify({
-                      type: "tool_use",
-                      name: toolUse.name,
-                      input: toolUse.input,
-                    })}\n\n`
-                  )
-                );
-              } catch {
-                // Ignore parse errors
-              }
-              return;
-            }
-
-            if (
-              line.trim() &&
-              !line.includes("[Claude]:") &&
-              !line.includes("[Tool]:") &&
-              !line.includes("__")
-            ) {
-              await writer.write(
-                encoder.encode(
-                  `data: ${JSON.stringify({
-                    type: "progress",
-                    message: line.trim(),
-                  })}\n\n`
-                )
-              );
-
-              const sandboxMatch = line.match(/Sandbox created: ([a-f0-9-]+)/);
-              if (sandboxMatch) {
-                sandboxId = sandboxMatch[1];
-              }
-
-              const previewMatch = line.match(/Preview URL: (https:\/\/\S+)/);
-              if (previewMatch) {
-                previewUrl = previewMatch[1];
-              }
-            }
-          },
-        });
-
-        sandboxId = result.sandboxId;
-        previewUrl = result.previewUrl;
+        const result = isFollowUp
+          ? await iterateWebsiteInDaytona({
+              sandboxId,
+              originalPrompt,
+              followUp,
+              onLog,
+            })
+          : await generateWebsiteInDaytona({
+              prompt,
+              onLog,
+            });
 
         await writer.write(
           encoder.encode(
             `data: ${JSON.stringify({
               type: "complete",
-              sandboxId,
-              previewUrl,
+              sandboxId: result.sandboxId,
+              previewUrl: result.previewUrl,
+              files: result.files?.map((f) => ({
+                path: f.path,
+                content: f.content,
+              })),
             })}\n\n`
           )
         );

@@ -6,15 +6,21 @@ export interface GeneratedFile {
 }
 
 const COMPONENT_PATH = "components/AppContent.tsx";
-const DEFAULT_MODEL = "qwen/qwen3-32b";
-const MIN_COMPONENT_LINES = 100;
+const FAST_MODEL = "llama-3.3-70b-versatile";
+const MIN_COMPONENT_LINES = 50;
 
-function getGroqModel(): string {
-  return process.env.GROQ_MODEL || DEFAULT_MODEL;
+function getCodeModel(): string {
+  return process.env.GROQ_CODE_MODEL || process.env.GROQ_MODEL || FAST_MODEL;
 }
 
-function usesReasoning(model: string): boolean {
-  return model.includes("qwen");
+function getPlanModel(): string {
+  return process.env.GROQ_PLAN_MODEL || getCodeModel();
+}
+
+function usesReasoning(model: string, enabled?: boolean): boolean {
+  if (enabled === false) return false;
+  if (enabled === true) return model.includes("qwen");
+  return false;
 }
 
 function emitAssistantMessage(
@@ -131,17 +137,31 @@ async function callGroq(
   system: string,
   user: string,
   maxTokens: number,
-  options?: { reasoning?: boolean }
+  options?: {
+    reasoning?: boolean;
+    model?: string;
+    onLog?: (message: string) => void;
+    timeoutMs?: number;
+  }
 ): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
     throw new Error("GROQ_API_KEY is not set");
   }
 
-  const model = getGroqModel();
-  const enableReasoning = options?.reasoning ?? usesReasoning(model);
+  const model = options?.model || getCodeModel();
+  const enableReasoning = usesReasoning(model, options?.reasoning);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 180000);
+  const timeoutMs = options?.timeoutMs ?? 120000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  let heartbeatCount = 0;
+  const heartbeat = options?.onLog
+    ? setInterval(() => {
+        heartbeatCount += 1;
+        options.onLog?.(`⏳ Still working... (${heartbeatCount * 10}s)`);
+      }, 10000)
+    : null;
 
   const body: Record<string, unknown> = {
     model,
@@ -150,11 +170,11 @@ async function callGroq(
       { role: "user", content: user },
     ],
     max_tokens: maxTokens,
-    temperature: 0.3,
+    temperature: 0.2,
   };
 
   if (enableReasoning) {
-    body.reasoning_effort = "default";
+    body.reasoning_effort = "low";
   }
 
   try {
@@ -190,69 +210,27 @@ async function callGroq(
     return content;
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("Groq API timed out");
+      throw new Error(`Groq API timed out after ${timeoutMs / 1000}s`);
     }
     throw error;
   } finally {
     clearTimeout(timeout);
+    if (heartbeat) clearInterval(heartbeat);
   }
-}
-
-async function thinkAboutFile(
-  fileName: string,
-  prompt: string,
-  plan: string,
-  onLog?: (message: string) => void
-): Promise<string> {
-  onLog?.(`🧠 Thinking about ${fileName}...`);
-
-  const thoughts = await callGroq(
-    `You are a senior React engineer planning ONE file before coding.
-
-Think step-by-step:
-1. What this file must do
-2. State variables and types needed
-3. Helper functions / handlers
-4. UI sections and layout (top to bottom)
-5. Edge cases and win/lose/error states
-6. Tailwind styling approach
-
-NO code. Be detailed and specific. 200-400 words.`,
-    `File to plan: ${fileName}\nUser request: ${prompt}\n\nProject plan:\n${plan}`,
-    1200,
-    { reasoning: true }
-  );
-
-  const cleaned = stripThinkingTags(thoughts);
-  emitAssistantMessage(onLog, `**Thinking: \`${fileName}\`**\n\n${cleaned}`);
-  onLog?.(`✓ Finished thinking about ${fileName}`);
-  return cleaned;
 }
 
 async function createPlan(
   prompt: string,
   onLog?: (message: string) => void
 ): Promise<string> {
-  onLog?.("🧠 Planning the full project...");
-  emitAssistantMessage(onLog, "Let me understand your request and plan the architecture...");
+  onLog?.("🧠 Planning the project...");
+  emitAssistantMessage(onLog, "Planning your app...");
 
   const plan = await callGroq(
-    `You are a senior frontend architect. Create a detailed project plan BEFORE any code.
-
-Sections:
-## Goal
-## User stories (bullets)
-## Features (detailed bullets)
-## Data & state
-## UI layout (every section)
-## AppContent component (full behavior spec)
-## Page shell
-## Visual design (colors, typography, spacing)
-
-NO code. Be thorough. 400-600 words.`,
+    `Create a concise project plan for a Next.js app. Sections: Goal, Features, State, UI layout, Visual style. NO code. Max 250 words.`,
     `User request: ${prompt}`,
-    1500,
-    { reasoning: true }
+    600,
+    { model: getPlanModel(), reasoning: false, onLog }
   );
 
   const cleaned = stripThinkingTags(plan);
@@ -266,41 +244,29 @@ async function generateComponent(
   plan: string,
   onLog?: (message: string) => void
 ): Promise<string> {
-  const fileThoughts = await thinkAboutFile(
-    COMPONENT_PATH,
-    prompt,
-    plan,
-    onLog
-  );
-
-  onLog?.(`✏️ Writing ${COMPONENT_PATH} (full implementation)...`);
+  onLog?.(`✏️ Writing ${COMPONENT_PATH}...`);
 
   const writeCode = async (extraInstruction = "") => {
     const raw = await callGroq(
-      `Write the COMPLETE components/AppContent.tsx for Next.js 14.
+      `Write COMPLETE components/AppContent.tsx for Next.js 14.
 
 STRICT RULES:
-- Return ONLY raw TSX. No markdown. No explanation outside code.
-- Minimum ${MIN_COMPONENT_LINES}+ lines of real code — NOT a stub.
+- Return ONLY raw TSX. No markdown.
+- ${MIN_COMPONENT_LINES}+ lines of real code — NOT a stub.
 - Start with "use client";
 - export default function AppContent()
-- ONLY import from "react" (useState, useEffect, useMemo, useCallback as needed)
+- ONLY import from "react"
 - NO external npm packages
-- Tailwind className only — polished dark UI, gradients, hover states, responsive
-- Include ALL logic: state, handlers, helper functions, sub-components inline if needed
-- For games: full rules, win detection, reset, turn indicator, board rendering
-- For dashboards: multiple sections with realistic sample data arrays
-- NO placeholders, NO "// TODO", NO empty divs`,
+- Tailwind only — polished dark UI, responsive
+- Full logic: state, handlers, win/lose, reset where needed
+- NO "// TODO" or placeholders`,
       `User request: ${prompt}
 
-Project plan:
+Plan:
 ${plan}
-
-File-specific thinking:
-${fileThoughts}
 ${extraInstruction}`,
-      8000,
-      { reasoning: true }
+      6000,
+      { model: getCodeModel(), reasoning: false, onLog }
     );
 
     let code = stripCodeFences(raw);
@@ -319,9 +285,9 @@ ${extraInstruction}`,
   let code = await writeCode();
 
   if (countLines(code) < MIN_COMPONENT_LINES) {
-    onLog?.(`⚠️ Component too short (${countLines(code)} lines) — expanding...`);
+    onLog?.(`⚠️ Component too short (${countLines(code)} lines) — retrying...`);
     code = await writeCode(
-      "\n\nIMPORTANT: Previous attempt was too short. Write a MUCH longer, complete implementation with at least 150 lines."
+      "\nIMPORTANT: Write a longer, complete implementation (80+ lines)."
     );
   }
 
@@ -334,30 +300,23 @@ async function generatePage(
   plan: string,
   onLog?: (message: string) => void
 ): Promise<string> {
-  const fileThoughts = await thinkAboutFile("app/page.tsx", prompt, plan, onLog);
-
   onLog?.("✏️ Writing app/page.tsx...");
 
   const raw = await callGroq(
-    `Write app/page.tsx for Next.js 14 app router.
+    `Write app/page.tsx for Next.js 14.
 
 STRICT RULES:
 - Return ONLY raw TSX. No markdown.
-- At least 40 lines — rich layout, not a bare wrapper
 - export default function Page()
 - MUST import AppContent from "@/components/AppContent"
 - ONLY imports: "react" and "@/components/AppContent"
-- Tailwind — hero header, subtitle, stats row or nav, footer, responsive padding
-- Match the user request theme`,
+- Tailwind — hero header, subtitle, footer, responsive`,
     `User request: ${prompt}
 
 Plan:
-${plan}
-
-File thinking:
-${fileThoughts}`,
-    2000,
-    { reasoning: true }
+${plan}`,
+    1500,
+    { model: getCodeModel(), reasoning: false, onLog }
   );
 
   let code = stripCodeFences(raw);
@@ -396,7 +355,7 @@ export async function generateFilesWithGroq(
   prompt: string,
   onLog?: (message: string) => void
 ): Promise<GeneratedFile[]> {
-  onLog?.(`Using model: ${getGroqModel()}`);
+  onLog?.(`Using model: ${getCodeModel()}`);
 
   const plan = await createPlan(prompt, onLog);
   const componentCode = await generateComponent(prompt, plan, onLog);
@@ -410,4 +369,109 @@ export async function generateFilesWithGroq(
     `✓ Done — ${files.length} files, ${countLines(componentCode) + countLines(pageCode)} lines of AI code`
   );
   return files;
+}
+
+export interface FollowUpContext {
+  originalPrompt: string;
+  followUp: string;
+  existingComponent: string;
+  existingPage: string;
+}
+
+async function generateFollowUpComponent(
+  ctx: FollowUpContext,
+  onLog?: (message: string) => void
+): Promise<string> {
+  onLog?.("🧠 Thinking about your follow-up...");
+  emitAssistantMessage(
+    onLog,
+    `Got it — I'll update the app based on: "${ctx.followUp}"`
+  );
+
+  onLog?.(`✏️ Updating ${COMPONENT_PATH}...`);
+
+  const raw = await callGroq(
+    `Update an EXISTING Next.js component based on a follow-up request.
+
+STRICT RULES:
+- Return COMPLETE updated components/AppContent.tsx (full file, not a diff)
+- Return ONLY raw TSX. No markdown.
+- Keep "use client" and export default function AppContent()
+- ONLY import from "react"
+- Fix bugs and apply improvements requested
+- Keep working code unchanged where possible
+- Tailwind only, polished dark UI`,
+    `Original request: ${ctx.originalPrompt}
+Follow-up: ${ctx.followUp}
+
+Current file:
+${ctx.existingComponent}`,
+    6000,
+    { model: getCodeModel(), reasoning: false, onLog }
+  );
+
+  let code = stripCodeFences(raw);
+  code = sanitizeCode(code, { defaultExportName: "AppContent" });
+  code = ensureUseClient(code);
+  code = ensureDefaultExport(code, "AppContent", ctx.existingComponent);
+
+  onLog?.(`✓ Updated ${COMPONENT_PATH} (${countLines(code)} lines)`);
+  return code;
+}
+
+async function generateFollowUpPage(
+  ctx: FollowUpContext,
+  updatedComponent: string,
+  onLog?: (message: string) => void
+): Promise<string> {
+  onLog?.("✏️ Updating app/page.tsx if needed...");
+
+  const raw = await callGroq(
+    `Update app/page.tsx if the follow-up requires layout/title changes. Otherwise return the existing file with minimal tweaks.
+
+STRICT RULES:
+- Return COMPLETE app/page.tsx (full file)
+- ONLY imports: react and @/components/AppContent
+- export default function Page()
+- Tailwind dark theme`,
+    `Original: ${ctx.originalPrompt}
+Follow-up: ${ctx.followUp}
+
+Current page.tsx:
+${ctx.existingPage}
+
+Updated AppContent (for context):
+${updatedComponent.slice(0, 3000)}`,
+    1500,
+    { model: getCodeModel(), reasoning: false, onLog }
+  );
+
+  let code = stripCodeFences(raw);
+  code = sanitizeCode(code, {
+    extraImports: ["@/components/AppContent"],
+    defaultExportName: "Page",
+  });
+
+  if (!code.includes("@/components/AppContent")) {
+    code = `import AppContent from "@/components/AppContent";\n\n${code}`;
+  }
+
+  code = ensureDefaultExport(code, "Page", ctx.existingPage);
+  onLog?.(`✓ Updated app/page.tsx (${countLines(code)} lines)`);
+  return code;
+}
+
+export async function generateFollowUpFiles(
+  ctx: FollowUpContext,
+  onLog?: (message: string) => void
+): Promise<GeneratedFile[]> {
+  onLog?.(`Using model: ${getGroqModel()} for follow-up`);
+
+  const componentCode = await generateFollowUpComponent(ctx, onLog);
+  const pageCode = await generateFollowUpPage(ctx, componentCode, onLog);
+
+  return [
+    { path: COMPONENT_PATH, content: componentCode },
+    { path: "app/page.tsx", content: pageCode },
+  ];
 }
