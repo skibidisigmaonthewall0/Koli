@@ -13,7 +13,7 @@ const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 let routerProcess: ChildProcess | null = null;
 
 function getGroqModel(): string {
-  return process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+  return process.env.GROQ_MODEL || "qwen/qwen3-32b";
 }
 
 export function getGroqRouterConfig(): Record<string, unknown> {
