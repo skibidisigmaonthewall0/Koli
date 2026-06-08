@@ -6,11 +6,24 @@ export interface GeneratedFile {
 }
 
 const COMPONENT_PATH = "components/AppContent.tsx";
-const DEFAULT_MODEL = "llama-3.3-70b-versatile";
+const DEFAULT_MODEL = "llama-3.1-8b-instant";
+const FALLBACK_MODEL = "llama-3.1-8b-instant";
 const MIN_COMPONENT_LINES = 40;
 
+// Qwen free tier TPM is 6000 — our requests need more. Auto-switch.
+const LOW_TPM_MODELS = ["qwen"];
+
 function getGroqModel(): string {
-  return process.env.GROQ_MODEL || DEFAULT_MODEL;
+  const configured = process.env.GROQ_MODEL || DEFAULT_MODEL;
+  if (LOW_TPM_MODELS.some((m) => configured.includes(m))) {
+    return FALLBACK_MODEL;
+  }
+  return configured;
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars) + "\n// ... truncated for token limit ...";
 }
 
 function emitAssistantMessage(
@@ -123,66 +136,135 @@ function ensureDefaultExport(code: string, name: string, fallback: string): stri
   return `${code}\n\n${fallback}`;
 }
 
-async function callGroq(
+function buildPageShell(prompt: string): string {
+  const title = prompt.replace(/"/g, "'").slice(0, 60);
+  return `import AppContent from "@/components/AppContent";
+
+export default function Page() {
+  return (
+    <main className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-black text-white">
+      <div className="mx-auto max-w-5xl px-6 py-10">
+        <header className="mb-8 text-center">
+          <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">${title}</h1>
+          <p className="mt-2 text-gray-400">Built with AI</p>
+        </header>
+        <AppContent />
+        <footer className="mt-12 border-t border-gray-800 pt-6 text-center text-sm text-gray-500">
+          Generated app
+        </footer>
+      </div>
+    </main>
+  );
+}`;
+}
+
+async function callGroqOnce(
+  model: string,
   system: string,
   user: string,
   maxTokens: number,
-  onLog?: (message: string) => void
+  signal: AbortSignal
 ): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
     throw new Error("GROQ_API_KEY is not set");
   }
 
-  const model = getGroqModel();
+  const response = await fetch(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        max_tokens: maxTokens,
+        temperature: 0.4,
+      }),
+      signal,
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const err = new Error(`Groq API ${response.status}: ${errorText}`);
+    (err as Error & { status: number }).status = response.status;
+    throw err;
+  }
+
+  const data = await response.json();
+  const message = data.choices?.[0]?.message;
+  const content = message?.content || message?.reasoning || "";
+
+  if (!content) {
+    throw new Error("Groq returned an empty response");
+  }
+
+  return content;
+}
+
+async function callGroq(
+  system: string,
+  user: string,
+  maxTokens: number,
+  onLog?: (message: string) => void
+): Promise<string> {
+  const primaryModel = getGroqModel();
+  const configured = process.env.GROQ_MODEL || DEFAULT_MODEL;
+
+  if (LOW_TPM_MODELS.some((m) => configured.includes(m)) && configured !== primaryModel) {
+    onLog?.(
+      `⚠️ ${configured} has a 6000 TPM limit — using ${primaryModel} instead`
+    );
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
-
   const heartbeat = setInterval(() => {
     onLog?.("⏳ Still generating code...");
   }, 15000);
 
-  const body: Record<string, unknown> = {
-    model,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    max_tokens: maxTokens,
-    temperature: 0.4,
-  };
+  const models = [primaryModel];
+  if (!models.includes(FALLBACK_MODEL)) {
+    models.push(FALLBACK_MODEL);
+  }
 
   try {
-    const response = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
+    let lastError: Error | null = null;
+
+    for (const model of models) {
+      try {
+        return await callGroqOnce(
+          model,
+          system,
+          user,
+          maxTokens,
+          controller.signal
+        );
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        const status = (lastError as Error & { status?: number }).status;
+        const isTokenLimit =
+          status === 413 ||
+          lastError.message.includes("rate_limit") ||
+          lastError.message.includes("too large") ||
+          lastError.message.includes("TPM");
+
+        if (isTokenLimit && model !== FALLBACK_MODEL) {
+          onLog?.(`⚠️ Token limit hit on ${model}, retrying with ${FALLBACK_MODEL}...`);
+          continue;
+        }
+        throw lastError;
       }
-    );
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Groq API ${response.status}: ${errorText}`);
     }
 
-    const data = await response.json();
-    const message = data.choices?.[0]?.message;
-    const content =
-      message?.content ||
-      message?.reasoning ||
-      "";
-
-    if (!content) {
-      throw new Error("Groq returned an empty response");
-    }
-
-    return content;
+    throw lastError || new Error("Groq request failed");
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
       throw new Error("Groq API timed out after 2 minutes");
@@ -198,27 +280,15 @@ async function generateComponent(
   prompt: string,
   onLog?: (message: string) => void
 ): Promise<string> {
-  emitAssistantMessage(
-    onLog,
-    `Building **${COMPONENT_PATH}** for: "${prompt}"`
-  );
+  emitAssistantMessage(onLog, `Building **${COMPONENT_PATH}**`);
   onLog?.(`✏️ Writing ${COMPONENT_PATH}...`);
 
   const raw = await callGroq(
-    `Write the COMPLETE components/AppContent.tsx for Next.js 14.
-
-STRICT RULES:
-- Return ONLY raw TSX. No markdown. No explanation.
-- At least ${MIN_COMPONENT_LINES}+ lines of real working code.
-- Start with "use client";
-- export default function AppContent()
-- ONLY import from "react"
-- NO external npm packages
-- Tailwind className only — polished dark UI
-- For games: full rules, win detection, reset, board
-- NO placeholders, NO "// TODO"`,
-    `Build this: ${prompt}`,
-    6000,
+    `Write components/AppContent.tsx. Return ONLY raw TSX, no markdown.
+"use client"; export default function AppContent(). Import only from "react".
+Tailwind dark UI. ${MIN_COMPONENT_LINES}+ lines. Full working logic, no TODOs.`,
+    truncateText(`Build: ${prompt}`, 500),
+    4096,
     onLog
   );
 
@@ -237,55 +307,6 @@ STRICT RULES:
   return code;
 }
 
-async function generatePage(
-  prompt: string,
-  onLog?: (message: string) => void
-): Promise<string> {
-  onLog?.("✏️ Writing app/page.tsx...");
-
-  const raw = await callGroq(
-    `Write app/page.tsx for Next.js 14 app router.
-
-STRICT RULES:
-- Return ONLY raw TSX. No markdown.
-- At least 30 lines
-- export default function Page()
-- MUST import AppContent from "@/components/AppContent"
-- ONLY imports: "react" and "@/components/AppContent"
-- Tailwind dark theme layout with header and footer`,
-    `Build a page shell for: ${prompt}`,
-    1500,
-    onLog
-  );
-
-  let code = stripCodeFences(raw);
-  code = sanitizeCode(code, {
-    extraImports: ["@/components/AppContent"],
-    defaultExportName: "Page",
-  });
-
-  if (!code.includes("@/components/AppContent")) {
-    code = `import AppContent from "@/components/AppContent";\n\n${code}`;
-  }
-
-  code = ensureDefaultExport(
-    code,
-    "Page",
-    `export default function Page() {
-  return (
-    <main className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 text-white">
-      <div className="mx-auto max-w-5xl px-6 py-12">
-        <AppContent />
-      </div>
-    </main>
-  );
-}`
-  );
-
-  onLog?.(`✓ app/page.tsx (${countLines(code)} lines)`);
-  return code;
-}
-
 export async function generateFilesWithGroq(
   prompt: string,
   onLog?: (message: string) => void
@@ -293,7 +314,8 @@ export async function generateFilesWithGroq(
   onLog?.(`Using model: ${getGroqModel()}`);
 
   const componentCode = await generateComponent(prompt, onLog);
-  const pageCode = await generatePage(prompt, onLog);
+  const pageCode = buildPageShell(prompt);
+  onLog?.(`✓ app/page.tsx (template, ${countLines(pageCode)} lines)`);
 
   const files = getNextJsScaffold();
   files.push({ path: COMPONENT_PATH, content: componentCode });
@@ -317,22 +339,17 @@ export async function generateFollowUpFiles(
   onLog?: (message: string) => void
 ): Promise<GeneratedFile[]> {
   onLog?.(`Using model: ${getGroqModel()} for follow-up`);
-  emitAssistantMessage(
-    onLog,
-    `Updating the app: "${ctx.followUp}"`
-  );
+  emitAssistantMessage(onLog, `Updating: "${ctx.followUp}"`);
 
   onLog?.(`✏️ Updating ${COMPONENT_PATH}...`);
   const componentRaw = await callGroq(
-    `Update the EXISTING components/AppContent.tsx based on the follow-up request.
-Return the COMPLETE updated file. ONLY raw TSX. "use client". export default function AppContent().
-ONLY import from "react". Tailwind only. NO external packages.`,
-    `Original: ${ctx.originalPrompt}
-Follow-up: ${ctx.followUp}
-
-Current file:
-${ctx.existingComponent}`,
-    6000,
+    `Update AppContent.tsx per follow-up. Return COMPLETE file, raw TSX only.
+"use client", export default function AppContent(), react imports only, Tailwind.`,
+    truncateText(
+      `Original: ${ctx.originalPrompt}\nFollow-up: ${ctx.followUp}\n\nCurrent:\n${ctx.existingComponent}`,
+      12000
+    ),
+    4096,
     onLog
   );
 
@@ -346,30 +363,8 @@ ${ctx.existingComponent}`,
   );
   onLog?.(`✓ Updated ${COMPONENT_PATH} (${countLines(componentCode)} lines)`);
 
-  onLog?.("✏️ Updating app/page.tsx if needed...");
-  const pageRaw = await callGroq(
-    `Update app/page.tsx if needed for the follow-up. Return COMPLETE file.
-ONLY imports: react and @/components/AppContent. export default function Page().`,
-    `Follow-up: ${ctx.followUp}
-Current page:
-${ctx.existingPage}`,
-    1500,
-    onLog
-  );
-
-  let pageCode = stripCodeFences(pageRaw);
-  pageCode = sanitizeCode(pageCode, {
-    extraImports: ["@/components/AppContent"],
-    defaultExportName: "Page",
-  });
-  if (!pageCode.includes("@/components/AppContent")) {
-    pageCode = `import AppContent from "@/components/AppContent";\n\n${pageCode}`;
-  }
-  pageCode = ensureDefaultExport(pageCode, "Page", ctx.existingPage);
-  onLog?.(`✓ Updated app/page.tsx (${countLines(pageCode)} lines)`);
-
   return [
     { path: COMPONENT_PATH, content: componentCode },
-    { path: "app/page.tsx", content: pageCode },
+    { path: "app/page.tsx", content: ctx.existingPage },
   ];
 }
