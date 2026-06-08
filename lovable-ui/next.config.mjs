@@ -16,7 +16,6 @@ const nextConfig = {
     serverComponentsExternalPackages: [
       "@daytonaio/sdk",
       "@daytonaio/api-client",
-      "untildify",
     ],
   },
 };

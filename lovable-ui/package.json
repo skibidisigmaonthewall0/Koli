@@ -16,6 +16,9 @@
     "react": "^18",
     "react-dom": "^18"
   },
+  "overrides": {
+    "untildify": "4.0.0"
+  },
   "devDependencies": {
     "@types/node": "^20",
     "@types/react": "^18",
