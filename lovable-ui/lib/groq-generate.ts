@@ -7,23 +7,32 @@ export interface GeneratedFile {
 
 const COMPONENT_PATH = "components/AppContent.tsx";
 const DEFAULT_MODEL = "llama-3.1-8b-instant";
-const FALLBACK_MODEL = "llama-3.1-8b-instant";
-const MIN_COMPONENT_LINES = 40;
+const MIN_COMPONENT_LINES = 30;
 
-// Qwen free tier TPM is 6000 — our requests need more. Auto-switch.
-const LOW_TPM_MODELS = ["qwen"];
+/** Groq on_demand free tier: input + max_tokens must stay under ~6000 */
+const GROQ_TPM_BUDGET = 5500;
 
 function getGroqModel(): string {
-  const configured = process.env.GROQ_MODEL || DEFAULT_MODEL;
-  if (LOW_TPM_MODELS.some((m) => configured.includes(m))) {
-    return FALLBACK_MODEL;
-  }
-  return configured;
+  return process.env.GROQ_MODEL || DEFAULT_MODEL;
+}
+
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3.5);
 }
 
 function truncateText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
-  return text.slice(0, maxChars) + "\n// ... truncated for token limit ...";
+  return text.slice(0, maxChars);
+}
+
+function budgetMaxTokens(
+  system: string,
+  user: string,
+  desired: number
+): number {
+  const inputEst = estimateTokens(system) + estimateTokens(user);
+  const available = GROQ_TPM_BUDGET - inputEst - 80;
+  return Math.max(512, Math.min(desired, available));
 }
 
 function emitAssistantMessage(
@@ -44,9 +53,7 @@ function stripCodeFences(text: string): string {
   const fenced = withoutThinking.match(
     /```(?:tsx|typescript|jsx|javascript)?\s*([\s\S]*?)```/
   );
-  if (fenced) {
-    return fenced[1].trim();
-  }
+  if (fenced) return fenced[1].trim();
   return withoutThinking.trim();
 }
 
@@ -65,23 +72,14 @@ function sanitizeCode(
   ]);
 
   const cleaned: string[] = [];
-
   for (const line of code.split("\n")) {
     const trimmed = line.trim();
-
     if (trimmed.startsWith("import ")) {
       const match = trimmed.match(/from\s+['"]([^'"]+)['"]/);
-      const source = match?.[1];
-      if (source && allowed.has(source)) {
-        cleaned.push(line);
-      }
+      if (match?.[1] && allowed.has(match[1])) cleaned.push(line);
       continue;
     }
-
-    if (trimmed.includes("next/head") || trimmed.includes("<Head")) {
-      continue;
-    }
-
+    if (trimmed.includes("next/head") || trimmed.includes("<Head")) continue;
     cleaned.push(line);
   }
 
@@ -93,46 +91,27 @@ function sanitizeCode(
       /export\s+default\s+function\s+\w+/g,
       "export default function AppContent"
     );
-    if (!/export\s+default\s+function\s+AppContent/.test(result)) {
-      result = result.replace(
-        /export\s+default\s+\w+/g,
-        "export default function AppContent"
-      );
-    }
   } else {
     result = result.replace(
       /export\s+default\s+App\b/g,
       `export default function ${exportName}`
     );
-    result = result.replace(/function\s+App\s*\(/g, `function ${exportName}(`);
   }
-
   return result;
 }
 
 function ensureUseClient(code: string): string {
-  const withoutDirective = code.replace(/^["']use client["'];\s*/m, "").trim();
-
-  const needsClient =
-    withoutDirective.includes("useState") ||
-    withoutDirective.includes("useEffect") ||
-    withoutDirective.includes("onClick") ||
-    withoutDirective.includes("onChange") ||
-    withoutDirective.includes("onSubmit");
-
-  if (needsClient) {
-    return `"use client";\n\n${withoutDirective}`;
-  }
-  return withoutDirective;
+  const body = code.replace(/^["']use client["'];\s*/m, "").trim();
+  const needs =
+    body.includes("useState") ||
+    body.includes("useEffect") ||
+    body.includes("onClick");
+  return needs ? `"use client";\n\n${body}` : body;
 }
 
 function ensureDefaultExport(code: string, name: string, fallback: string): string {
-  if (new RegExp(`export\\s+default\\s+function\\s+${name}`).test(code)) {
-    return code;
-  }
-  if (/export\s+default/.test(code)) {
-    return code;
-  }
+  if (new RegExp(`export\\s+default\\s+function\\s+${name}`).test(code)) return code;
+  if (/export\s+default/.test(code)) return code;
   return `${code}\n\n${fallback}`;
 }
 
@@ -142,16 +121,12 @@ function buildPageShell(prompt: string): string {
 
 export default function Page() {
   return (
-    <main className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-black text-white">
+    <main className="min-h-screen bg-gradient-to-b from-gray-950 to-black text-white">
       <div className="mx-auto max-w-5xl px-6 py-10">
         <header className="mb-8 text-center">
-          <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">${title}</h1>
-          <p className="mt-2 text-gray-400">Built with AI</p>
+          <h1 className="text-3xl font-bold">${title}</h1>
         </header>
         <AppContent />
-        <footer className="mt-12 border-t border-gray-800 pt-6 text-center text-sm text-gray-500">
-          Generated app
-        </footer>
       </div>
     </main>
   );
@@ -166,9 +141,7 @@ async function callGroqOnce(
   signal: AbortSignal
 ): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) {
-    throw new Error("GROQ_API_KEY is not set");
-  }
+  if (!apiKey) throw new Error("GROQ_API_KEY is not set");
 
   const response = await fetch(
     "https://api.groq.com/openai/v1/chat/completions",
@@ -199,75 +172,57 @@ async function callGroqOnce(
   }
 
   const data = await response.json();
-  const message = data.choices?.[0]?.message;
-  const content = message?.content || message?.reasoning || "";
-
-  if (!content) {
-    throw new Error("Groq returned an empty response");
-  }
-
+  const content =
+    data.choices?.[0]?.message?.content ||
+    data.choices?.[0]?.message?.reasoning ||
+    "";
+  if (!content) throw new Error("Groq returned an empty response");
   return content;
+}
+
+function isTokenLimitError(error: Error): boolean {
+  const status = (error as Error & { status?: number }).status;
+  return (
+    status === 413 ||
+    error.message.includes("rate_limit") ||
+    error.message.includes("too large") ||
+    error.message.includes("TPM")
+  );
 }
 
 async function callGroq(
   system: string,
   user: string,
-  maxTokens: number,
+  desiredMaxTokens: number,
   onLog?: (message: string) => void
 ): Promise<string> {
-  const primaryModel = getGroqModel();
-  const configured = process.env.GROQ_MODEL || DEFAULT_MODEL;
-
-  if (LOW_TPM_MODELS.some((m) => configured.includes(m)) && configured !== primaryModel) {
-    onLog?.(
-      `⚠️ ${configured} has a 6000 TPM limit — using ${primaryModel} instead`
-    );
-  }
-
+  const model = getGroqModel();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
-  const heartbeat = setInterval(() => {
-    onLog?.("⏳ Still generating code...");
-  }, 15000);
+  const heartbeat = setInterval(() => onLog?.("⏳ Still generating..."), 15000);
 
-  const models = [primaryModel];
-  if (!models.includes(FALLBACK_MODEL)) {
-    models.push(FALLBACK_MODEL);
-  }
+  let sys = system;
+  let usr = user;
+  let maxTok = budgetMaxTokens(sys, usr, desiredMaxTokens);
 
   try {
-    let lastError: Error | null = null;
-
-    for (const model of models) {
+    for (let attempt = 0; attempt < 4; attempt++) {
       try {
-        return await callGroqOnce(
-          model,
-          system,
-          user,
-          maxTokens,
-          controller.signal
-        );
+        return await callGroqOnce(model, sys, usr, maxTok, controller.signal);
       } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-        const status = (lastError as Error & { status?: number }).status;
-        const isTokenLimit =
-          status === 413 ||
-          lastError.message.includes("rate_limit") ||
-          lastError.message.includes("too large") ||
-          lastError.message.includes("TPM");
+        const err = error instanceof Error ? error : new Error(String(error));
+        if (!isTokenLimitError(err) || attempt === 3) throw err;
 
-        if (isTokenLimit && model !== FALLBACK_MODEL) {
-          onLog?.(`⚠️ Token limit hit on ${model}, retrying with ${FALLBACK_MODEL}...`);
-          continue;
-        }
-        throw lastError;
+        maxTok = Math.floor(maxTok * 0.6);
+        usr = truncateText(usr, Math.floor(usr.length * 0.6));
+        sys = truncateText(sys, 200);
+        onLog?.(`⚠️ Shrinking request (attempt ${attempt + 2}, max_tokens=${maxTok})...`);
       }
     }
-
-    throw lastError || new Error("Groq request failed");
+    throw new Error("Groq request failed after retries");
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("Groq API timed out after 2 minutes");
+      throw new Error("Groq API timed out");
     }
     throw error;
   } finally {
@@ -276,6 +231,9 @@ async function callGroq(
   }
 }
 
+const SYSTEM_COMPONENT =
+  'Write AppContent.tsx. Raw TSX only. "use client". export default function AppContent(). react imports only. Tailwind.';
+
 async function generateComponent(
   prompt: string,
   onLog?: (message: string) => void
@@ -283,14 +241,8 @@ async function generateComponent(
   emitAssistantMessage(onLog, `Building **${COMPONENT_PATH}**`);
   onLog?.(`✏️ Writing ${COMPONENT_PATH}...`);
 
-  const raw = await callGroq(
-    `Write components/AppContent.tsx. Return ONLY raw TSX, no markdown.
-"use client"; export default function AppContent(). Import only from "react".
-Tailwind dark UI. ${MIN_COMPONENT_LINES}+ lines. Full working logic, no TODOs.`,
-    truncateText(`Build: ${prompt}`, 500),
-    4096,
-    onLog
-  );
+  const userMsg = truncateText(prompt, 300);
+  const raw = await callGroq(SYSTEM_COMPONENT, userMsg, 1800, onLog);
 
   let code = stripCodeFences(raw);
   code = sanitizeCode(code, { defaultExportName: "AppContent" });
@@ -299,9 +251,27 @@ Tailwind dark UI. ${MIN_COMPONENT_LINES}+ lines. Full working logic, no TODOs.`,
     code,
     "AppContent",
     `export default function AppContent() {
-  return <div className="p-6 text-white">App content</div>;
+  return <div className="p-6 text-white">Loading...</div>;
 }`
   );
+
+  if (countLines(code) < MIN_COMPONENT_LINES) {
+    onLog?.("⚠️ Expanding component (2nd pass)...");
+    const expanded = await callGroq(
+      SYSTEM_COMPONENT,
+      truncateText(
+        `Expand this component for "${userMsg}". Return COMPLETE file:\n${code}`,
+        2500
+      ),
+      1800,
+      onLog
+    );
+    const more = stripCodeFences(expanded);
+    if (countLines(more) > countLines(code)) {
+      code = sanitizeCode(more, { defaultExportName: "AppContent" });
+      code = ensureUseClient(code);
+    }
+  }
 
   onLog?.(`✓ ${COMPONENT_PATH} (${countLines(code)} lines)`);
   return code;
@@ -315,15 +285,13 @@ export async function generateFilesWithGroq(
 
   const componentCode = await generateComponent(prompt, onLog);
   const pageCode = buildPageShell(prompt);
-  onLog?.(`✓ app/page.tsx (template, ${countLines(pageCode)} lines)`);
+  onLog?.(`✓ app/page.tsx (template)`);
 
   const files = getNextJsScaffold();
   files.push({ path: COMPONENT_PATH, content: componentCode });
   files.push({ path: "app/page.tsx", content: pageCode });
 
-  onLog?.(
-    `✓ Done — ${files.length} files, ${countLines(componentCode) + countLines(pageCode)} lines of AI code`
-  );
+  onLog?.(`✓ Done — ${files.length} files`);
   return files;
 }
 
@@ -341,15 +309,17 @@ export async function generateFollowUpFiles(
   onLog?.(`Using model: ${getGroqModel()} for follow-up`);
   emitAssistantMessage(onLog, `Updating: "${ctx.followUp}"`);
 
+  const snippet = truncateText(ctx.existingComponent, 3500);
+  const userMsg = truncateText(
+    `Fix: ${ctx.followUp}\n\nFile:\n${snippet}`,
+    4000
+  );
+
   onLog?.(`✏️ Updating ${COMPONENT_PATH}...`);
   const componentRaw = await callGroq(
-    `Update AppContent.tsx per follow-up. Return COMPLETE file, raw TSX only.
-"use client", export default function AppContent(), react imports only, Tailwind.`,
-    truncateText(
-      `Original: ${ctx.originalPrompt}\nFollow-up: ${ctx.followUp}\n\nCurrent:\n${ctx.existingComponent}`,
-      12000
-    ),
-    4096,
+    'Update AppContent.tsx. Return COMPLETE raw TSX. "use client". react only.',
+    userMsg,
+    1800,
     onLog
   );
 
