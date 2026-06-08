@@ -63,8 +63,20 @@ function GeneratePageContent() {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Failed to generate website");
+        const text = await response.text();
+        try {
+          const errorData = JSON.parse(text);
+          throw new Error(errorData.error || "Failed to generate website");
+        } catch (parseError) {
+          if (parseError instanceof Error && parseError.message !== text) {
+            throw parseError;
+          }
+          throw new Error(
+            text.includes("<!DOCTYPE")
+              ? `Server error (${response.status}). Check Vercel env vars: GROQ_API_KEY, DAYTONA_API_KEY.`
+              : text || `Failed to generate website (${response.status})`
+          );
+        }
       }
 
       const reader = response.body?.getReader();

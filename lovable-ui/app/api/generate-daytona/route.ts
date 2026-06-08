@@ -1,28 +1,49 @@
 import { NextRequest } from "next/server";
-import { generateWebsiteInDaytona } from "@/lib/daytona-generate";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 60;
+
+async function loadGenerator() {
+  try {
+    return await import("@/lib/daytona-generate");
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to load Daytona SDK";
+    throw new Error(`Server setup error: ${message}`);
+  }
+}
+
+export async function GET() {
+  const hasKeys = Boolean(
+    process.env.DAYTONA_API_KEY && process.env.GROQ_API_KEY
+  );
+
+  return Response.json({
+    ok: hasKeys,
+    hasDaytonaKey: Boolean(process.env.DAYTONA_API_KEY),
+    hasGroqKey: Boolean(process.env.GROQ_API_KEY),
+  });
+}
 
 export async function POST(req: NextRequest) {
   try {
     const { prompt } = await req.json();
 
     if (!prompt) {
-      return new Response(
-        JSON.stringify({ error: "Prompt is required" }),
-        { status: 400, headers: { "Content-Type": "application/json" } }
-      );
+      return Response.json({ error: "Prompt is required" }, { status: 400 });
     }
 
     if (!process.env.DAYTONA_API_KEY || !process.env.GROQ_API_KEY) {
-      return new Response(
-        JSON.stringify({
-          error: "Missing API keys (DAYTONA_API_KEY and GROQ_API_KEY required)",
-        }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
+      return Response.json(
+        {
+          error:
+            "Missing API keys. Add DAYTONA_API_KEY and GROQ_API_KEY in Vercel → Settings → Environment Variables, then redeploy.",
+        },
+        { status: 500 }
       );
     }
+
+    const { generateWebsiteInDaytona } = await loadGenerator();
 
     const encoder = new TextEncoder();
     const stream = new TransformStream();
@@ -138,10 +159,8 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    return new Response(JSON.stringify({ error: message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
+    const message =
+      error instanceof Error ? error.message : "Internal server error";
+    return Response.json({ error: message }, { status: 500 });
   }
 }

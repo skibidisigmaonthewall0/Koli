@@ -13,7 +13,11 @@ if (fs.existsSync(rootEnvPath)) {
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {
-    serverComponentsExternalPackages: ["@daytonaio/sdk"],
+    serverComponentsExternalPackages: [
+      "@daytonaio/sdk",
+      "@daytonaio/api-client",
+      "untildify",
+    ],
   },
 };
 
