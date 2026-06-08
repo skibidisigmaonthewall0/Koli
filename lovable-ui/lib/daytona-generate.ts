@@ -74,14 +74,21 @@ export async function generateWebsiteInDaytona({
 
     log("\n4. Installing Claude Code SDK and Groq router...");
     const installResult = await sandbox.process.executeCommand(
-      "npm install @anthropic-ai/claude-code@latest @musistudio/claude-code-router@latest",
-      projectDir,
+      `cd "${projectDir}" && npm install @anthropic-ai/claude-code@2.1.168 @musistudio/claude-code-router@2.0.0 --legacy-peer-deps && test -f node_modules/@anthropic-ai/claude-code/package.json && echo "INSTALL_OK"`,
+      rootDir,
       undefined,
       180000
     );
 
-    if (installResult.exitCode !== 0) {
-      throw new Error("Failed to install Claude Code SDK");
+    log(installResult.result || "");
+
+    if (
+      installResult.exitCode !== 0 ||
+      !installResult.result?.includes("INSTALL_OK")
+    ) {
+      throw new Error(
+        `Failed to install Claude Code SDK: ${installResult.result || "unknown error"}`
+      );
     }
     log("✓ Claude Code SDK and Groq router installed");
 
@@ -104,73 +111,90 @@ export async function generateWebsiteInDaytona({
     log("✓ Groq router started");
 
     log("\n7. Creating generation script...");
-    const generationScript = `const { query } = require('@anthropic-ai/claude-code');
-const fs = require('fs');
+    const escapedPrompt = prompt
+      .replace(/\\/g, "\\\\")
+      .replace(/`/g, "\\`")
+      .replace(/\$/g, "\\$");
 
-async function generateWebsite() {
-  const prompt = \`${prompt.replace(/`/g, "\\`")}
+    const generationScript = `import { query } from '@anthropic-ai/claude-code';
+import fs from 'fs';
 
-  Important requirements:
-  - Create a NextJS app with TypeScript and Tailwind CSS
-  - Use the app directory structure
-  - Create all files in the current directory
-  - Include a package.json with all necessary dependencies
-  - Make the design modern and responsive
-  - Add at least a home page and one other page
-  - Include proper navigation between pages
-  \`;
+const prompt = \`${escapedPrompt}
 
-  const messages = [];
-  const abortController = new AbortController();
+Important requirements:
+- Create a NextJS app with TypeScript and Tailwind CSS
+- Use the app directory structure
+- Create all files in the current directory
+- Include a package.json with all necessary dependencies
+- Make the design modern and responsive
+- Add at least a home page and one other page
+- Include proper navigation between pages
+\`;
 
-  try {
-    for await (const message of query({
-      prompt: prompt,
-      abortController: abortController,
-      options: {
-        maxTurns: 20,
-        allowedTools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Bash', 'LS', 'Glob', 'Grep']
-      }
-    })) {
-      messages.push(message);
+const messages = [];
+const abortController = new AbortController();
 
-      if (message.type === 'text') {
-        console.log('[Claude]:', (message.text || '').substring(0, 80) + '...');
-        console.log('__CLAUDE_MESSAGE__', JSON.stringify({ type: 'assistant', content: message.text }));
-      } else if (message.type === 'tool_use') {
-        console.log('[Tool]:', message.name, message.input?.file_path || '');
-        console.log('__TOOL_USE__', JSON.stringify({ type: 'tool_use', name: message.name, input: message.input }));
-      } else if (message.type === 'result') {
-        console.log('__TOOL_RESULT__', JSON.stringify({ type: 'tool_result', result: message.result }));
-      }
+try {
+  for await (const message of query({
+    prompt,
+    abortController,
+    options: {
+      maxTurns: 20,
+      allowedTools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Bash', 'LS', 'Glob', 'Grep']
     }
+  })) {
+    messages.push(message);
 
-    fs.writeFileSync('generation-log.json', JSON.stringify(messages, null, 2));
-  } catch (error) {
-    console.error('Generation error:', error);
-    process.exit(1);
+    if (message.type === 'text') {
+      console.log('[Claude]:', (message.text || '').substring(0, 80) + '...');
+      console.log('__CLAUDE_MESSAGE__', JSON.stringify({ type: 'assistant', content: message.text }));
+    } else if (message.type === 'tool_use') {
+      console.log('[Tool]:', message.name, message.input?.file_path || '');
+      console.log('__TOOL_USE__', JSON.stringify({ type: 'tool_use', name: message.name, input: message.input }));
+    } else if (message.type === 'result') {
+      console.log('__TOOL_RESULT__', JSON.stringify({ type: 'tool_result', result: message.result }));
+    }
   }
-}
 
-generateWebsite().catch(console.error);`;
+  fs.writeFileSync('generation-log.json', JSON.stringify(messages, null, 2));
+} catch (error) {
+  console.error('Generation error:', error);
+  process.exit(1);
+}`;
 
     await sandbox.process.executeCommand(
-      `cat > generate.js << 'SCRIPT_EOF'\n${generationScript}\nSCRIPT_EOF`,
-      projectDir
+      `cat > "${projectDir}/generate.mjs" << 'SCRIPT_EOF'\n${generationScript}\nSCRIPT_EOF`,
+      rootDir
     );
-    log("✓ Generation script written");
+
+    const sdkCheck = await sandbox.process.executeCommand(
+      `cd "${projectDir}" && node --input-type=module -e "import('@anthropic-ai/claude-code').then(() => console.log('SDK_OK')).catch((e) => { console.error(e); process.exit(1); })"`,
+      rootDir,
+      undefined,
+      60000
+    );
+
+    if (
+      sdkCheck.exitCode !== 0 ||
+      !sdkCheck.result?.includes("SDK_OK")
+    ) {
+      throw new Error(
+        `Claude Code SDK not loadable in sandbox: ${sdkCheck.result || "unknown error"}`
+      );
+    }
+
+    log("✓ Generation script written and SDK verified");
 
     log("\n8. Running code generation with Groq...");
     log(`Prompt: "${prompt}"`);
 
     const genResult = await sandbox.process.executeCommand(
-      "node generate.js",
-      projectDir,
+      `cd "${projectDir}" && node generate.mjs`,
+      rootDir,
       {
         ANTHROPIC_BASE_URL: "http://127.0.0.1:3456",
         ANTHROPIC_API_KEY: "groq-router",
-        GROQ_API_KEY: process.env.GROQ_API_KEY,
-        NODE_PATH: `${projectDir}/node_modules`,
+        GROQ_API_KEY: process.env.GROQ_API_KEY || "",
       },
       600000
     );
