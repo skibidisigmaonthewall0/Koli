@@ -1,5 +1,5 @@
 import { Daytona } from "@daytonaio/sdk";
-import { buildSandboxGenerateScript } from "./sandbox-generate-script";
+import { generateFilesWithGroq } from "./groq-generate";
 
 export interface DaytonaGenerateResult {
   success: boolean;
@@ -28,7 +28,7 @@ export async function generateWebsiteInDaytona({
 }: DaytonaGenerateOptions): Promise<DaytonaGenerateResult> {
   const log = createLogger(onLog);
 
-  log("🚀 Starting website generation in Daytona sandbox...\n");
+  log("🚀 Starting website generation...\n");
 
   if (!process.env.DAYTONA_API_KEY || !process.env.GROQ_API_KEY) {
     throw new Error("DAYTONA_API_KEY and GROQ_API_KEY must be set");
@@ -51,7 +51,7 @@ export async function generateWebsiteInDaytona({
       }
       log(`✓ Connected to sandbox: ${sandbox.id}`);
     } else {
-      log("1. Creating new Daytona sandbox...");
+      log("1. Creating Daytona sandbox...");
       sandbox = await daytona.create({
         public: true,
         image: "node:20",
@@ -61,51 +61,40 @@ export async function generateWebsiteInDaytona({
     }
 
     const rootDir = await sandbox.getUserRootDir();
-    log(`✓ Working directory: ${rootDir}`);
+    const projectDir = "website-project";
 
     log("\n2. Setting up project directory...");
-    const projectDir = `${rootDir}/website-project`;
-    await sandbox.process.executeCommand(`mkdir -p "${projectDir}"`, rootDir);
-    log(`✓ Created project directory: ${projectDir}`);
+    await sandbox.fs.createFolder(projectDir, "755");
+    log(`✓ Project directory ready`);
 
-    log("\n3. Writing Groq generation script...");
-    const scriptB64 = Buffer.from(buildSandboxGenerateScript()).toString("base64");
-    const writeScript = await sandbox.process.executeCommand(
-      `echo "${scriptB64}" | base64 -d > "${projectDir}/generate.mjs"`,
-      rootDir,
-      undefined,
-      30000
-    );
-
-    if (writeScript.exitCode !== 0) {
-      throw new Error(`Failed to write generation script: ${writeScript.result}`);
-    }
-    log("✓ Generation script ready");
-
-    log("\n4. Generating website with Groq...");
+    log("\n3. Generating code with Groq (on server)...");
     log(`Prompt: "${prompt}"`);
 
-    const genResult = await sandbox.process.executeCommand(
-      `cd "${projectDir}" && node generate.mjs`,
-      rootDir,
-      {
-        GROQ_API_KEY: process.env.GROQ_API_KEY,
-        GROQ_MODEL: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
-        USER_PROMPT_B64: Buffer.from(prompt).toString("base64"),
-      },
-      300000
+    const files = await generateFilesWithGroq(prompt, log);
+
+    log("\n4. Uploading files to sandbox...");
+    await sandbox.fs.uploadFiles(
+      files.map((file) => ({
+        source: Buffer.from(file.content, "utf-8"),
+        destination: `${projectDir}/${file.path}`,
+      })),
+      120000
     );
 
-    log(genResult.result || "");
-
-    if (genResult.exitCode !== 0) {
-      throw new Error(`Generation failed: ${genResult.result || "unknown error"}`);
+    for (const file of files) {
+      log(`✓ Uploaded ${file.path}`);
+      log(
+        `__TOOL_USE__ ${JSON.stringify({
+          type: "tool_use",
+          name: "Write",
+          input: { file_path: file.path },
+        })}`
+      );
     }
-    log("✓ Website files generated");
 
     log("\n5. Installing dependencies...");
     const npmInstall = await sandbox.process.executeCommand(
-      `cd "${projectDir}" && npm install`,
+      `cd ${projectDir} && npm install`,
       rootDir,
       undefined,
       300000
@@ -117,33 +106,27 @@ export async function generateWebsiteInDaytona({
     }
     log("✓ Dependencies installed");
 
-    log("\n6. Starting development server...");
+    log("\n6. Starting dev server...");
     await sandbox.process.executeCommand(
-      `cd "${projectDir}" && nohup npm run dev -- -p 3000 -H 0.0.0.0 > dev-server.log 2>&1 &`,
+      `cd ${projectDir} && nohup npm run dev -- -p 3000 -H 0.0.0.0 > dev-server.log 2>&1 &`,
       rootDir,
       { PORT: "3000" }
     );
 
-    log("Waiting for server to start...");
-    await new Promise((resolve) => setTimeout(resolve, 10000));
-
-    const checkServer = await sandbox.process.executeCommand(
-      `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000 || echo failed`,
-      projectDir
-    );
-    log(`Server check: ${checkServer.result?.trim() || "unknown"}`);
+    log("Waiting for server...");
+    await new Promise((resolve) => setTimeout(resolve, 12000));
 
     log("\n7. Getting preview URL...");
     const preview = await sandbox.getPreviewLink(3000);
 
-    log("\n✨ SUCCESS! Website generated!");
+    log("\n✨ SUCCESS!");
     log(`Sandbox ID: ${sandboxId}`);
     log(`Preview URL: ${preview.url}`);
 
     return {
       success: true,
       sandboxId: sandboxId!,
-      projectDir,
+      projectDir: `${rootDir}/${projectDir}`,
       previewUrl: preview.url,
     };
   } catch (error) {
